@@ -73,8 +73,7 @@ app.use(express.json());
 app.use(cors(corsOptions));
 
 app.get('/api/ping', (_req, res) => {
-    console.log("Someone pinged");
-    res.send("Someone pinged here");
+    res.send("pong");
 });
 
 app.get("/api/patients", (_req, res) => {
