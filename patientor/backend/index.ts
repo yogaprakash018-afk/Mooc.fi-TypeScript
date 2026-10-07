@@ -1,4 +1,9 @@
-import express, { type Express } from "express";
+import express, {
+    type Express,
+    type Request,
+    type Response,
+    type NextFunction
+} from "express";
 import cors from 'cors';
 import data1, { type Diagnosis } from "./data/diagnosis.ts";
 import data2, { type genric } from './data/patients.ts';
@@ -8,7 +13,6 @@ import z from 'zod';
 const diagnoses: Diagnosis[] = data1;
 
 type Patient = Omit<genric, "ssn">;
-type NewPatientEntry = Omit<Patient, "id">;
 
 const Gender = {
     MALE: 'male',
@@ -26,19 +30,36 @@ function omitSSN(arrObjs: genric[]) {
         occupation,
     }));
 }
+
 const patients: Patient[] = omitSSN(data2);
 
 const NewEntrySchema = z.object({
-  name : z.string(),
-  dateOfBirth : z.iso.date(), //ISO date string such as "2000-05-20"
-  gender : z.enum(Gender),
-  occupation : z.string()
+    name: z.string(),
+    dateOfBirth: z.iso.date(), //ISO date string such as "2000-05-20"
+    gender: z.enum(Gender),
+    occupation: z.string()
 });
+
+// Instead of manually writing the NewPatient type, TypeScript gets the type directly from the Zod schema.
+// This means the Zod schema is now the single source of truth for the shape of a new patient.
 
 type NewPatient = z.infer<typeof NewEntrySchema>;
 
-const toNewPatientEntry = (object: unknown): NewPatient => {
-    return NewEntrySchema.parse(object);  
+// const toNewPatientEntry = (object: unknown): NewPatient => {
+//     return NewEntrySchema.parse(object);
+// };
+
+// We no longer need the toNewPatientEntry function. Instead, the validation is moved into middleware.
+// Middleware runs BEFORE the actual route handler. If the request body is valid, next() allows the request to continue to the route handler.
+// If the request body is invalid, parse() throws a ZodError, which is passed to the error-handling middleware using next(error).
+
+const newPatientParser = (req: Request, _res: Response, next: NextFunction) => {
+    try {
+        NewEntrySchema.parse(req.body);
+        next();
+    } catch (error: unknown) {
+        next(error);
+    };
 };
 
 const app: Express = express();
@@ -64,31 +85,77 @@ app.get("/api/diagnoses", (_req, res) => {
     res.send(diagnoses);
 });
 
-app.post("/api/patients", (req, res) => {
-    try {
-        const newPatientEntry : NewPatientEntry = toNewPatientEntry(req.body);
+// newPatientParser runs FIRST.
+//
+// Request
+//    ↓
+// newPatientParser
+//    ↓
+// Zod validates req.body
+//    ↓
+// next()
+//    ↓
+// route handler
+//
+// If validation fails:
+//
+// Request
+//    ↓
+// newPatientParser
+//    ↓
+// ZodError
+//    ↓
+// next(error)
+//    ↓
+// errorMiddleware
+//
+// Request<unknown, unknown, NewPatient> tells TypeScript that req.body is a NewPatient inside this route handler.
+//
+// The third generic parameter of Request represents the type of req.body.
+
+app.post("/api/patients", newPatientParser, (req: Request<unknown, unknown, NewPatient>, res: Response<Patient>) => {
+        // At this point the middleware has already validated req.body using NewEntrySchema.
+        // Therefore we can directly use req.body as NewPatient.
         const newPatient: Patient = {
             id: uuid(),
-            ...newPatientEntry,
+            ...req.body,
         };
         patients.push(newPatient);
         res.json(newPatient);
-    } catch (error: unknown) {
-        const errorMessage = 'Error in adding patient to library';
-        if (error instanceof z.ZodError) {
-            console.log(errorMessage);
-            res.status(400).send({ error: error.issues });    
-        } else {    
-            console.log(errorMessage);  
-        res.status(400).send({ error: 'unknown error' });    
-        };  
-    };
-});
+    }
+);
 
+// Error-handling middleware. Express recognizes this as error middleware because
+// it has FOUR parameters:
+// error, req, res, next
+// When newPatientParser calls next(error), Express skips the normal route handlers and sends the error here. If the error is a ZodError, we send the validation problems back to the client with status 400.
+// If it is some other error, we pass it to the next error-handling middleware using next(error).
+
+const errorMiddleware = (error: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (error instanceof z.ZodError) {
+        const errorMessage = 'Error in adding patient to library';
+        console.log(errorMessage);
+        res.status(400).send({
+            error: error.issues
+        });
+    } else {
+        console.log('Unknown error');
+        res.status(400).send({
+            error: 'unknown error'
+        });
+        // If you wanted another error middleware to handle
+        // unknown errors instead, you could use:
+        // next(error);
+    };
+};
+
+// Error middleware should be registered after the routes,
+// because it handles errors passed from the middleware/routes above.
+
+app.use(errorMiddleware);
 app.listen(port, () => {
     console.log("Successfully listening to port: ", port);
 });
-
 
 // const parseName = (name: unknown): string => {
 //     // if (!isString(name) || name === '') {
@@ -99,7 +166,6 @@ app.listen(port, () => {
 //     // But after the call, if the code proceeds past the exception (that is, the type guard returned true), then the compiler knows that the comment is of type string
 //     return z.string().parse(name); // unlike safeparse() parse breaks the execution and throws error for wrong data.
 // };
-
 
 // const isDate = (date: string): boolean => {
 //     return Boolean(Date.parse(date)); // Parses a string containing a date, and returns the number of milliseconds between that date and midnight, January 1, 1970.
@@ -128,7 +194,6 @@ app.listen(port, () => {
 //     // But in course same but Object.values(Weather) as string[] here take the Weather interface get it's values as array and assert them as string then simply .includes(weather or param), no need of assertion here too.
 // };
 
-
 // if (!object || typeof object !== 'object') {
 //         throw new Error('Incorrect or missing data');
 //     }
@@ -137,8 +202,8 @@ app.listen(port, () => {
 //         'name' in object &&
 //         'dateOfBirth' in object &&
 //         'gender' in object &&
-//         'occupation' in object 
-//     ) { 
+//         'occupation' in object
+//     ) {
 //         // in the above if we can use Object.hasOwn(object, name) but the problem is now that in top if we made sure that object is type Object,
 //         // TypeScript cannot infer it has name property using hasOwn() so rather using in keyword checks existense of key itself rather true or false.
 //         const newEntry: NewPatientEntry = {
